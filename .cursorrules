@@ -1,0 +1,328 @@
+# Instructions
+
+During your interaction with the user, if you find anything reusable in this project (e.g. version of a library, model name), especially about a fix to a mistake you made or a correction you received, you should take note in the `Lessons` section in the `.cursorrules` file so you will not make the same mistake again. 
+
+You should also use the `.cursorrules` file as a Scratchpad to organize your thoughts. Especially when you receive a new task, you should first review the content of the Scratchpad, clear old different task if necessary, first explain the task, and plan the steps you need to take to complete the task. You can use todo markers to indicate the progress, e.g.
+[X] Task 1
+[X] Task 2
+
+Also update the progress of the task in the Scratchpad when you finish a subtask.
+Especially when you finished a milestone, it will help to improve your depth of task accomplishment to use the Scratchpad to reflect and plan.
+The goal is to help you maintain a big picture as well as the progress of the task. Always refer to the Scratchpad when you plan the next step.
+
+# Tools
+
+Note all the tools are in python3. So in the case you need to do batch processing, you can always consult the python files and write your own script.
+
+## Screenshot Verification
+
+The screenshot verification workflow allows you to capture screenshots of web pages and verify their appearance using LLMs. The following tools are available:
+
+1. Screenshot Capture:
+```bash
+venv/bin/python3 tools/screenshot_utils.py URL [--output OUTPUT] [--width WIDTH] [--height HEIGHT]
+```
+
+2. LLM Verification with Images:
+```bash
+venv/bin/python3 tools/llm_api.py --prompt "Your verification question" --provider {openai|anthropic} --image path/to/screenshot.png
+```
+
+Example workflow:
+```python
+from screenshot_utils import take_screenshot_sync
+from llm_api import query_llm
+
+# Take a screenshot
+
+screenshot_path = take_screenshot_sync('https://example.com', 'screenshot.png')
+
+# Verify with LLM
+
+response = query_llm(
+    "What is the background color and title of this webpage?",
+    provider="openai",  # or "anthropic"
+    image_path=screenshot_path
+)
+print(response)
+```
+
+## LLM
+
+You always have an LLM at your side to help you with the task. For simple tasks, you could invoke the LLM by running the following command:
+```
+venv/bin/python3 ./tools/llm_api.py --prompt "What is the capital of France?" --provider "anthropic"
+```
+
+The LLM API supports multiple providers:
+- OpenAI (default, model: gpt-4o)
+- Azure OpenAI (model: configured via AZURE_OPENAI_MODEL_DEPLOYMENT in .env file, defaults to gpt-4o-ms)
+- DeepSeek (model: deepseek-chat)
+- Anthropic (model: claude-3-sonnet-20240229)
+- Gemini (model: gemini-pro)
+- Local LLM (model: Qwen/Qwen2.5-32B-Instruct-AWQ)
+
+But usually it's a better idea to check the content of the file and use the APIs in the `tools/llm_api.py` file to invoke the LLM if needed.
+
+## Web browser
+
+You could use the `tools/web_scraper.py` file to scrape the web.
+```bash
+venv/bin/python3 ./tools/web_scraper.py --max-concurrent 3 URL1 URL2 URL3
+```
+This will output the content of the web pages.
+
+## Search engine
+
+You could use the `tools/search_engine.py` file to search the web.
+```bash
+venv/bin/python3 ./tools/search_engine.py "your search keywords"
+```
+This will output the search results in the following format:
+```
+URL: https://example.com
+Title: This is the title of the search result
+Snippet: This is a snippet of the search result
+```
+If needed, you can further use the `web_scraper.py` file to scrape the web page content.
+
+# Lessons
+
+## User Specified Lessons
+
+- You have a python venv in ./venv. Always use (activate) it when doing python development. First, to check whether 'uv' is available, use `which uv`. If that's the case, first activate the venv, and then use `uv pip install` to install packages. Otherwise, fall back to `pip`.
+- Due to Cursor's limit, when you use `git` and `gh` and need to submit a multiline commit message, first write the message in a file, and then use `git commit -F <filename>` or similar command to commit. And then remove the file. Include "[Cursor] " in the commit message and PR title.
+
+## Cursor learned
+
+- For search results, ensure proper handling of different character encodings (UTF-8) for international queries
+- When using seaborn styles in matplotlib, use 'seaborn-v0_8' instead of 'seaborn' as the style name due to recent seaborn version changes
+- Use 'gpt-4o' as the model name for OpenAI's GPT-4 with vision capabilities
+- When searching for recent news, use the current year (2025) instead of previous years, or simply use the "recent" keyword to get the latest information
+- When fixing TypeScript errors in Cloudflare Workers, use `(variable as any)` type casting for D1 database query results since they return unknown types
+- Always run `npx tsc --noEmit` to check for TypeScript errors before deployment
+- When deploying to Cloudflare Workers, use `wrangler deploy --env production` to deploy to production environment with correct database bindings
+
+# Scratchpad
+
+## 在线考试系统开发任务
+
+### 任务描述
+开发一个基于Cloudflare Workers和Pages的在线考试web app，具体功能包括：
+- 支持三种题型：单选、多选、判断
+- 从题库文件(questions.htm)读取题目并存储到D1数据库
+- 用户手机号登录，选择答题模式（背题模式/考试模式）
+- 随机抽取50道题（单选20题，多选10题，判断20题），每题2分
+- 手机端答题，每页显示一道题
+- 背题模式立即显示答案，考试模式不显示
+- 答题完成后显示分数并记录成绩
+
+### 技术要求
+- 基于Cloudflare Workers和Pages
+- 使用D1数据库存储题库
+- 代码提交至GitHub
+- 配置和环境变量使用KV存储
+
+### 项目规划
+[X] 1. 分析题库文件格式，设计数据库结构
+[X] 2. 初始化Cloudflare项目结构
+[X] 3. 创建D1数据库和表结构
+[X] 4. 开发题库解析和导入功能
+[X] 5. 开发用户认证系统（手机号登录）
+[X] 6. 开发试卷生成逻辑
+[X] 7. 开发前端答题界面（移动端优化）
+[X] 8. 开发答题逻辑和模式切换
+[X] 9. 开发成绩统计和记录功能
+[X] 10. 修复代码问题和测试
+[X] 11. 部署到Cloudflare并配置GitHub
+[X] 12. 题库数据修复和优化
+[X] 13. 最终测试和优化
+[X] 14. 项目目录整理（创建db目录，移动SQL脚本）
+
+### 当前进度
+✅ 第1-14步已完成：核心功能开发、测试、部署、题库数据修复和项目整理完成
+
+### 部署信息
+- **生产环境地址**: https://exam-app-production.chenrf-dev.workers.dev
+- **生产数据库**: exam-database-prod (ab98eb7f-07a3-4ea9-900d-eaa24113ef97)
+- **题目分布**: 判断题86道，单选题99道，多选题39道，总计224道
+- **部署状态**: ✅ 成功部署到Cloudflare Workers
+
+### 已完成的功能
+1. **题库分析和数据导入**：
+   - 解析HTML题库文件，提取224道题目（86道判断题，138道单选题）
+   - 创建完整的数据库结构（6个表）
+   - 成功导入所有题目到D1数据库
+
+2. **Cloudflare项目设置**：
+   - 初始化Wrangler项目
+   - 配置D1数据库绑定
+   - 设置TypeScript开发环境
+
+3. **后端API开发**：
+   - 用户登录API（手机号验证）
+   - 考试会话创建API
+   - 题目获取API（支持动态路由）
+   - 答案提交API（支持两种模式）
+   - 考试完成和成绩计算API
+
+4. **前端界面开发**：
+   - 响应式登录页面
+   - 模式选择（背题/考试）
+   - 答题界面（支持单选和判断题）
+   - 答案反馈（背题模式）
+   - 题目导航
+   - 考试结果页面
+   - 重新开始功能
+
+5. **生产环境部署**：
+   - 创建生产D1数据库
+   - 导入题库数据到生产环境
+   - 修复多选题分类问题
+   - 成功部署到Cloudflare Workers
+
+### 技术调整
+- 发现并修复了题目类型分类错误：39道多选题被错误标记为单选题
+- 更新数据库：将答案长度大于1的题目正确分类为多选题
+- 最终题目分布：判断题86道，单选题99道，多选题39道，总计224道
+- 考试题目分配：判断题20道 + 单选题20道 + 多选题10道 = 总共50道题
+- 使用嵌入式HTML/CSS/JS简化部署
+
+### 已解决的问题
+1. **代码修复**：
+   - ✅ 修复JavaScript中的正则表达式转义问题
+   - ✅ 完善getCurrentQuestionId()函数
+   - ✅ 添加考试结果统计功能
+   - ✅ 修复所有TypeScript类型错误
+   - ✅ 修复动态路由问题（使用|分隔符替代:）
+   - ✅ 修复多选题分类错误，正确识别和处理多选题
+   - ✅ 修复A选项与题干混合的问题（涉及题目93,94,103,104,106,124,136,145,153,157,165,175）
+
+2. **功能完善**：
+   - ✅ 实现考试完成后的成绩计算和显示
+   - ✅ 添加考试结果页面
+   - ✅ 优化错误处理和用户体验
+   - ✅ 添加多选题前端界面和交互逻辑
+
+3. **功能测试**：
+   - ✅ 用户登录API测试通过
+   - ✅ 考试开始API测试通过
+   - ✅ 题目获取API测试通过（单选、多选、判断题）
+   - ✅ 答案提交API测试通过（所有题型）
+   - ✅ 前端界面截图验证
+   - ✅ 多选题功能完整测试通过
+
+### 当前状态
+- 开发服务器运行正常 (http://localhost:8787)
+- 生产环境部署成功 (https://exam-app-production.chenrf-dev.workers.dev)
+- 所有TypeScript错误已修复
+- 所有核心API功能测试通过
+- 应用界面完整且响应式
+- 完整功能测试通过
+- 准备进行最终在线测试
+
+### 完整功能测试结果 ✅
+1. **用户登录功能**：✅ 正常
+   - 手机号验证正确
+   - 用户创建和登录成功
+
+2. **考试会话管理**：✅ 正常
+   - 背题模式和考试模式创建成功
+   - 题目分布完全正确（判断20题+单选20题+多选10题=50题）
+
+3. **题目获取功能**：✅ 正常
+   - 判断题获取正常
+   - 单选题获取正常，包含选项
+   - 多选题获取正常，包含选项
+
+4. **答案提交功能**：✅ 正常
+   - 判断题答案提交和验证正确
+   - 单选题答案提交和验证正确
+   - 多选题答案提交和验证正确
+   - 错误答案处理正确
+
+5. **模式区分功能**：✅ 正常
+   - 背题模式：显示正确答案和是否正确
+   - 考试模式：只显示是否正确，不显示答案
+
+6. **前端界面**：✅ 正常
+   - 响应式设计适配移动端
+   - 界面美观，用户体验良好
+
+### 题库数据修复完成 ✅
+已修复的问题：
+1. **A选项与题干混合问题**：修复了12道题目（93,94,103,104,106,124,136,145,153,157,165,175）
+   - 将混在题干末尾的A选项内容正确分离
+   - 补充了缺失的A选项到options字段
+   - 修复了错误的答案（如第103题答案从"("修正为"A"）
+
+2. **C选项与D选项混合问题**：修复了第190题
+   - 将混在C选项末尾的D选项内容正确分离
+   - C选项和D选项现在都能正确显示
+
+3. **修复范围**：
+   - 本地开发数据库：✅ 已修复
+   - 生产环境数据库：✅ 已修复
+
+4. **修复效果**：
+   - 题目显示正常，A选项不再与题干混合
+   - C选项和D选项正确分离
+   - 所有选项都正确显示
+   - 答案判断逻辑正确
+
+### 最新修复问题 ✅
+1. **完成考试失败问题**：
+   - 修复了字段名错误：`end_time` → `completed_at`
+   - 修复了exam_results表INSERT语句缺少必要字段（user_id和mode）
+   - 增加了会话存在性检查和错误处理
+   - 完成考试API现在可以正常工作
+
+2. **多选题用户体验问题**：
+   - 修复了每次点击选项就触发显示答案的问题
+   - 添加了"确认答案"按钮，用户需要手动确认多选答案
+   - 改善了多选题的界面样式和交互体验
+   - 避免了背题模式下多选题的反复提示
+
+### 新增功能实现 ✅
+1. **防重复题目功能**：
+   - 实现了试卷生成时的重复题目检查机制
+   - 使用Set数据结构确保同一张试卷内没有重复题目
+   - 如果去重后题目不足50道，自动补充其他随机题目
+
+2. **智能选题系统**：
+   - 新增user_question_stats表记录用户答题历史
+   - 实现智能选题算法：优先选择未答过、答错过、答题次数少的题目
+   - 每次答题自动更新用户答题统计（总次数、正确次数、最后答题时间等）
+   - 提升用户学习效率，避免重复练习已掌握的题目
+
+3. **错题复习功能**：
+   - 新增错题查询API：`GET /api/user/:userId/wrong-questions`
+   - 新增错题复习会话API：`POST /api/user/:userId/review-wrong`
+   - 更新数据库schema，exam_sessions表支持'review'模式
+   - 前端新增"错题复习"按钮和相应的交互逻辑
+   - 错题复习会话只包含用户曾经答错的题目
+
+### 技术改进
+- 扩展了exam_sessions表的mode字段，支持'study'、'exam'、'review'三种模式
+- 新增user_question_stats表来追踪用户答题历史和统计信息
+- 优化了前端界面，支持三种不同的答题模式
+- 改进了题目类型显示，错题复习模式会显示"错题复习 - 题型"
+
+### 项目目录整理 ✅
+完成了项目文件结构的优化：
+1. **创建db目录**：将数据库相关脚本统一管理
+2. **移动SQL脚本**：移动了10个SQL脚本文件到db目录：
+   - `schema.sql` - 主要数据库结构定义
+   - `insert-questions.sql` - 题库数据导入脚本
+   - `schema_update.sql` - 智能选题功能更新
+   - `schema_update2.sql` - 错题复习功能更新
+   - `update_mode_constraint.sql` - 模式约束更新
+   - `update_mode_constraint_safe.sql` - 安全模式约束更新
+   - `fix_questions.sql` - A选项混合问题修复
+   - `fix_more_questions.sql` - 补充修复脚本
+   - `fix_answers.sql` - 答案错误修复
+   - `fix_cd_options.sql` - C/D选项混合修复
+3. **创建说明文档**：在db目录添加README.md文档，详细说明各脚本用途和使用方法
+
+### 下一步
+所有功能已完整实现，项目目录结构已优化，系统提供完整的学习、考试、复习闭环体验
