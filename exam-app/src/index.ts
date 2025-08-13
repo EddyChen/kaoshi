@@ -13,6 +13,7 @@
 
 export interface Env {
 	DB: D1Database;
+	SESSIONS: KVNamespace;
 }
 
 // 路由处理器
@@ -67,6 +68,49 @@ class Router {
 // 创建路由器
 const router = new Router();
 
+// ===== Session & Cookie Helpers =====
+function parseCookies(request: Request): Record<string, string> {
+	const header = request.headers.get('Cookie') || '';
+	const pairs = header.split(';').map((v) => v.trim()).filter(Boolean);
+	const out: Record<string, string> = {};
+	for (const pair of pairs) {
+		const idx = pair.indexOf('=');
+		if (idx > -1) {
+			const k = pair.slice(0, idx).trim();
+			const v = pair.slice(idx + 1).trim();
+			out[k] = decodeURIComponent(v);
+		}
+	}
+	return out;
+}
+
+async function getSessionUser(env: Env, request: Request): Promise<{ id: number; phone: string } | null> {
+	try {
+		const cookies = parseCookies(request);
+		const sid = cookies['sid'];
+		if (!sid) return null;
+		const raw = await env.SESSIONS.get(`session:${sid}`);
+		if (!raw) return null;
+		const data = JSON.parse(raw) as { userId: number; phone: string };
+		return { id: data.userId, phone: data.phone };
+	} catch {
+		return null;
+	}
+}
+
+function buildSessionCookie(token: string, isSecure: boolean): string {
+	const maxAge = 60 * 60 * 24 * 7; // 7 days
+	const parts = [
+		`sid=${encodeURIComponent(token)}`,
+		'Path=/',
+		'HttpOnly',
+		isSecure ? 'Secure' : '',
+		'SameSite=Lax',
+		`Max-Age=${maxAge}`
+	].filter(Boolean);
+	return parts.join('; ');
+}
+
 // 静态文件服务
 router.add('GET', '/', async (request: Request, env: Env) => {
 	return new Response(getIndexHTML(), {
@@ -113,11 +157,22 @@ router.add('POST', '/api/login', async (request: Request, env: Env) => {
 				.bind((user as any).id).run();
 		}
 
+		// 创建会话并下发 Cookie
+		const token = crypto.randomUUID();
+		await env.SESSIONS.put(
+			`session:${token}`,
+			JSON.stringify({ userId: (user as any).id, phone: (user as any).phone }),
+			{ expirationTtl: 60 * 60 * 24 * 7 }
+		);
+
 		return new Response(JSON.stringify({ 
 			success: true, 
 			user: { id: (user as any).id, phone: (user as any).phone }
 		}), {
-			headers: { 'Content-Type': 'application/json' }
+			headers: { 
+				'Content-Type': 'application/json',
+				'Set-Cookie': buildSessionCookie(token, new URL(request.url).protocol === 'https:')
+			}
 		});
 	} catch (error) {
 		return new Response(JSON.stringify({ error: '登录失败' }), {
@@ -127,11 +182,62 @@ router.add('POST', '/api/login', async (request: Request, env: Env) => {
 	}
 });
 
+// 获取当前登录用户与可恢复进度
+router.add('GET', '/api/me', async (request: Request, env: Env) => {
+	try {
+		const user = await getSessionUser(env, request);
+		if (!user) {
+			return new Response(JSON.stringify({ loggedIn: false }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		const activeSession = await env.DB.prepare(
+			'SELECT * FROM exam_sessions WHERE user_id = ? AND status = "active"'
+		).bind(user.id).first();
+
+		let progress: any = null;
+		let activeSessionId: any = null;
+		if (activeSession) {
+			activeSessionId = (activeSession as any).id;
+			const totalRow = await env.DB.prepare('SELECT COUNT(*) as c FROM exam_questions WHERE session_id = ?')
+				.bind(activeSessionId).first();
+			const totalQuestions = (totalRow as any)?.c || 0;
+			const raw = await env.SESSIONS.get(`progress:${activeSessionId}`);
+			if (raw) {
+				progress = JSON.parse(raw);
+			} else {
+				const firstRow = await env.DB.prepare(
+					'SELECT q.id as question_id FROM exam_questions eq JOIN questions q ON q.id = eq.question_id WHERE eq.session_id = ? AND eq.question_order = 1'
+				).bind(activeSessionId).first();
+				progress = {
+					sessionId: activeSessionId,
+					userId: user.id,
+					order: 1,
+					questionId: (firstRow as any)?.question_id || null,
+					totalQuestions,
+					mode: (activeSession as any).mode
+				};
+			}
+		}
+
+		return new Response(JSON.stringify({ loggedIn: true, user, activeSessionId, progress }), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+	} catch (e) {
+		return new Response(JSON.stringify({ loggedIn: false }), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+});
+
 // 开始考试
 router.add('POST', '/api/exam/start', async (request: Request, env: Env) => {
 	try {
 		const body = await request.json() as { userId?: number; mode?: string; categoryBig?: string; categorySmall?: string; total?: number };
-		const { userId, mode, categoryBig, categorySmall, total } = body;
+		const { mode, categoryBig, categorySmall, total } = body;
+		const sessionUser = await getSessionUser(env, request);
+		const userId = sessionUser?.id || (body.userId as number | undefined);
 		
 		if (!userId || !mode || !['study', 'exam'].includes(mode)) {
 			return new Response(JSON.stringify({ error: '参数错误' }), {
@@ -220,6 +326,36 @@ router.add('GET', '/api/exam/:sessionId/question/:order', async (request: Reques
 			options = JSON.parse((questionData as any).options);
 		}
 
+		// 查询用户已作答
+		let userAnswer: string | null = null;
+		try {
+			const answerRow = await env.DB.prepare(
+				'SELECT user_answer FROM user_answers WHERE session_id = ? AND question_id = ?'
+			).bind(sessionId, (questionData as any).id).first();
+			userAnswer = (answerRow as any)?.user_answer || null;
+		} catch {}
+
+		// 保存进度到 KV（忽略错误）
+		try {
+			const session = await env.DB.prepare('SELECT user_id, mode FROM exam_sessions WHERE id = ?')
+				.bind(sessionId).first();
+			const totalRow = await env.DB.prepare('SELECT COUNT(*) as c FROM exam_questions WHERE session_id = ?')
+				.bind(sessionId).first();
+			const totalQuestions = (totalRow as any)?.c || 0;
+			await env.SESSIONS.put(
+				`progress:${sessionId}`,
+				JSON.stringify({
+					sessionId,
+					userId: (session as any)?.user_id,
+					order,
+					questionId: (questionData as any).id,
+					totalQuestions,
+					mode: (session as any)?.mode
+				}),
+				{ expirationTtl: 60 * 60 * 24 * 7 }
+			);
+		} catch {}
+
 		return new Response(JSON.stringify({
 			success: true,
 			question: {
@@ -227,7 +363,8 @@ router.add('GET', '/api/exam/:sessionId/question/:order', async (request: Reques
 				type: questionData.type,
 				question: questionData.question,
 				options: options,
-				order: questionData.question_order
+				order: questionData.question_order,
+				userAnswer
 			}
 		}), {
 			headers: { 'Content-Type': 'application/json' }
@@ -339,6 +476,9 @@ router.add('POST', '/api/exam/:sessionId/finish', async (request: Request, env: 
 			VALUES (?, ?, ?, ?, ?, ?)
 		`).bind((session as any).user_id, sessionId, (session as any).mode, totalQuestions, correctAnswers, score).run();
 
+		// 清理 KV 进度
+		await env.SESSIONS.delete(`progress:${sessionId}`);
+
 		return new Response(JSON.stringify({
 			success: true,
 			result: {
@@ -395,57 +535,7 @@ router.add('GET', '/api/user/:userId/wrong-questions', async (request: Request, 
 });
 
 // 开始错题复习会话
-router.add('POST', '/api/user/:userId/review-wrong', async (request: Request, env: Env) => {
-	try {
-		const url = new URL(request.url);
-		const userId = parseInt(url.pathname.split('/')[3]);
-
-		// 获取用户的错题
-		const wrongQuestions = await env.DB.prepare(`
-			SELECT q.*
-			FROM questions q
-			JOIN user_question_stats uqs ON q.id = uqs.question_id
-			WHERE uqs.user_id = ? AND uqs.last_is_correct = 0
-			ORDER BY uqs.last_attempt_at DESC
-		`).bind(userId).all();
-
-		if (wrongQuestions.results.length === 0) {
-			return new Response(JSON.stringify({ 
-				success: false, 
-				message: '您还没有错题需要复习' 
-			}), {
-				headers: { 'Content-Type': 'application/json' }
-			});
-		}
-
-		// 创建错题复习会话
-		const session = await env.DB.prepare(
-			'INSERT INTO exam_sessions (user_id, mode, total_questions) VALUES (?, ?, ?) RETURNING *'
-		).bind(userId, 'review', wrongQuestions.results.length).first();
-
-		// 保存错题到考试题目表
-		for (let i = 0; i < wrongQuestions.results.length; i++) {
-			await env.DB.prepare(
-				'INSERT INTO exam_questions (session_id, question_id, question_order) VALUES (?, ?, ?)'
-			).bind((session as any).id, (wrongQuestions.results[i] as any).id, i + 1).run();
-		}
-
-		return new Response(JSON.stringify({
-			success: true,
-			sessionId: (session as any).id,
-			totalQuestions: wrongQuestions.results.length,
-			message: '开始错题复习'
-		}), {
-			headers: { 'Content-Type': 'application/json' }
-		});
-	} catch (error) {
-		console.error('开始错题复习失败:', error);
-		return new Response(JSON.stringify({ error: '开始错题复习失败' }), {
-			status: 500,
-			headers: { 'Content-Type': 'application/json' }
-		});
-	}
-});
+// 已移除错题复习相关 API
 
 // 智能选择题目（优先选择未答过/答错过/答题次数少的题目）
 async function selectRandomQuestions(db: D1Database, userId?: number, categoryBig?: string, categorySmall?: string, overrideTotal?: number) {
@@ -1006,16 +1096,17 @@ function getIndexHTML(): string {
 						<label for="categoryBig">题目大类</label>
 						<select id="categoryBig">
 							<option value="">全部</option>
-							<option value="信贷">信贷</option>
-							<option value="科技类">科技类</option>
+                            <option value="信贷">信贷</option>
+                            <option value="科技">科技</option>
 						</select>
 					</div>
 					<div class="filter-item">
 						<label for="categorySmall">题目小类</label>
 						<select id="categorySmall">
 							<option value="">全部</option>
-							<option value="A类">A类</option>
-							<option value="人工智能">人工智能</option>
+                            <option value="A类">A类</option>
+                            <option value="人工智能">人工智能</option>
+                            <option value="基础编程">基础编程</option>
 						</select>
 					</div>
 					<div class="filter-item">
@@ -1030,7 +1121,6 @@ function getIndexHTML(): string {
                 <div class="mode-buttons">
                     <button type="button" class="mode-btn active" data-mode="study">背题模式</button>
                     <button type="button" class="mode-btn" data-mode="exam">考试模式</button>
-                    <button type="button" class="mode-btn" data-mode="review">错题复习</button>
                 </div>
             </div>
             
@@ -1096,6 +1186,25 @@ function getIndexHTML(): string {
         let selectedAnswer = null;
         let totalQuestions = 50;
         
+        // 初始化：尝试恢复登录与进度
+        (async function init() {
+            try {
+                const res = await fetch('/api/me');
+                const data = await res.json();
+                if (data && data.loggedIn) {
+                    currentUser = data.user;
+                    if (data.activeSessionId && data.progress) {
+                        currentSession = data.activeSessionId;
+                        currentMode = data.progress.mode || currentMode;
+                        totalQuestions = data.progress.totalQuestions || totalQuestions;
+                        document.getElementById('loginPage').classList.add('hidden');
+                        document.getElementById('examPage').classList.remove('hidden');
+                        await loadQuestion(data.progress.order || 1);
+                    }
+                }
+            } catch (e) {}
+        })();
+        
         // 模式选择
         document.querySelectorAll('.mode-btn').forEach(btn => {
             btn.addEventListener('click', () => {
@@ -1136,51 +1245,43 @@ function getIndexHTML(): string {
         
         // 开始考试
 		async function startExam() {
-            try {
-                let response, data;
-                
-                if (currentMode === 'review') {
-                    // 错题复习模式
-                    response = await fetch(\`/api/user/\${currentUser.id}/review-wrong\`, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' }
-                    });
+			try {
+				let response, data;
+				
+				// 普通考试模式（纯JS，避免TS语法）
+				const categoryBigEl = document.getElementById('categoryBig');
+				const categorySmallEl = document.getElementById('categorySmall');
+				const totalEl = document.getElementById('total');
+				const categoryBig = categoryBigEl && categoryBigEl.value ? categoryBigEl.value : undefined;
+				const categorySmall = categorySmallEl && categorySmallEl.value ? categorySmallEl.value : undefined;
+				const totalStr = totalEl && totalEl.value ? totalEl.value : '';
+				const total = totalStr ? parseInt(totalStr, 10) : undefined;
+				response = await fetch('/api/exam/start', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ userId: currentUser.id, mode: currentMode, categoryBig, categorySmall, total })
+				});
+				
+				data = await response.json();
+				
+				if (data.success) {
+					currentSession = data.sessionId;
+					totalQuestions = data.totalQuestions || 50;
+					document.getElementById('loginPage').classList.add('hidden');
+					document.getElementById('examPage').classList.remove('hidden');
+					await loadQuestion(1);
 				} else {
-					// 普通考试模式（纯JS，避免TS语法）
-					const categoryBigEl = document.getElementById('categoryBig');
-					const categorySmallEl = document.getElementById('categorySmall');
-					const totalEl = document.getElementById('total');
-					const categoryBig = categoryBigEl && categoryBigEl.value ? categoryBigEl.value : undefined;
-					const categorySmall = categorySmallEl && categorySmallEl.value ? categorySmallEl.value : undefined;
-					const totalStr = totalEl && totalEl.value ? totalEl.value : '';
-					const total = totalStr ? parseInt(totalStr, 10) : undefined;
-                    response = await fetch('/api/exam/start', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ userId: currentUser.id, mode: currentMode, categoryBig, categorySmall, total })
-                    });
-                }
-                
-                data = await response.json();
-                
-                if (data.success) {
-                    currentSession = data.sessionId;
-                    totalQuestions = data.totalQuestions || 50;
-                    document.getElementById('loginPage').classList.add('hidden');
-                    document.getElementById('examPage').classList.remove('hidden');
-                    await loadQuestion(1);
-                } else {
-                    alert(data.message || data.error || '开始失败');
-                }
-            } catch (error) {
-                alert('网络错误，请重试');
-            }
-        }
+					alert(data.message || data.error || '开始失败');
+				}
+			} catch (error) {
+				alert('网络错误，请重试');
+			}
+		}
         
         // 加载题目
         async function loadQuestion(order) {
             try {
-                const response = await fetch(\`/api/exam/\${currentSession}/question/\${order}\`);
+                const response = await fetch('/api/exam/' + currentSession + '/question/' + order);
                 const data = await response.json();
                 
                 if (data.success) {
@@ -1198,7 +1299,7 @@ function getIndexHTML(): string {
         
         // 显示题目
         function displayQuestion(question) {
-            document.getElementById('questionNumber').textContent = \`第\${question.order}题\`;
+            document.getElementById('questionNumber').textContent = '第' + question.order + '题';
             document.getElementById('questionType').textContent = getTypeText(question.type);
             document.getElementById('questionText').textContent = question.question;
             
@@ -1206,30 +1307,62 @@ function getIndexHTML(): string {
             container.innerHTML = '';
             selectedAnswer = null;
             
-            if (question.type === 'judgment') {
-                const buttonsHtml = \`
-                    <div class="judgment-buttons">
-                        <button class="judgment-btn" onclick="selectAnswer('对')">对</button>
-                        <button class="judgment-btn" onclick="selectAnswer('错')">错</button>
-                    </div>
-                \`;
+                if (question.type === 'judgment') {
+                const buttonsHtml = '<div class="judgment-buttons">'
+                    + '<button class="judgment-btn" onclick="selectAnswer(&#39;对&#39;)">对</button>'
+                    + '<button class="judgment-btn" onclick="selectAnswer(&#39;错&#39;)">错</button>'
+                    + '</div>';
                 container.innerHTML = buttonsHtml;
+                // 回显已作答
+                if (question.userAnswer) {
+                    selectedAnswer = question.userAnswer;
+                    document.querySelectorAll('.judgment-btn').forEach(btn => {
+                        if (btn.textContent === question.userAnswer) {
+                            btn.classList.add('selected');
+                        }
+                    });
+                }
             } else if (question.type === 'multiple_choice') {
                 // 多选题
-                const optionsHtml = Object.entries(question.options).map(([key, value]) => 
-                    \`<label class="option-label">
-                        <input type="checkbox" class="option-checkbox" value="\${key}" onchange="selectMultipleAnswer()">
-                        <span class="option-text">\${key}. \${value}</span>
-                    </label>\`
-                ).join('');
-                const submitButtonHtml = \`<button class="submit-multiple-btn" onclick="submitMultipleAnswer()" disabled>确认答案</button>\`;
-                container.innerHTML = \`<div class="multiple-options">\${optionsHtml}</div>\${submitButtonHtml}\`;
+                const optionsHtml = Object.entries(question.options).map(function(entry) {
+                    const key = entry[0];
+                    const value = entry[1];
+                    return '<label class="option-label">'
+                        + '<input type="checkbox" class="option-checkbox" value="' + key + '" onchange="selectMultipleAnswer()">'
+                        + '<span class="option-text">' + key + '. ' + value + '</span>'
+                        + '</label>';
+                }).join('');
+                const submitButtonHtml = '<button class="submit-multiple-btn" onclick="submitMultipleAnswer()" disabled>确认答案</button>';
+                container.innerHTML = '<div class="multiple-options">' + optionsHtml + '</div>' + submitButtonHtml;
+                // 回显多选已作答（如 AB 等）
+                if (question.userAnswer) {
+                    selectedAnswer = question.userAnswer;
+                    const setVals = new Set(question.userAnswer.split(''));
+                    document.querySelectorAll('.option-checkbox').forEach(cb => {
+                        if (setVals.has(cb.value)) {
+                            cb.checked = true;
+                        }
+                    });
+                    const submitBtn = document.querySelector('.submit-multiple-btn');
+                    if (submitBtn) submitBtn.disabled = !selectedAnswer;
+                }
             } else {
                 // 单选题
-                const optionsHtml = Object.entries(question.options).map(([key, value]) => 
-                    \`<button class="option" onclick="selectAnswer('\${key}')">\${key}. \${value}</button>\`
-                ).join('');
+                const optionsHtml = Object.entries(question.options).map(function(entry) {
+                    const key = entry[0];
+                    const value = entry[1];
+                    return '<button class="option" onclick="selectAnswer(&#39;' + key + '&#39;)">' + key + '. ' + value + '</button>';
+                }).join('');
                 container.innerHTML = optionsHtml;
+                // 回显单选已作答
+                if (question.userAnswer) {
+                    selectedAnswer = question.userAnswer;
+                    document.querySelectorAll('.option').forEach(btn => {
+                        if (btn.textContent.startsWith('' + question.userAnswer + '.')) {
+                            btn.classList.add('selected');
+                        }
+                    });
+                }
             }
             
             // 隐藏答案反馈
@@ -1276,7 +1409,7 @@ function getIndexHTML(): string {
             if (!selectedAnswer || !currentQuestionId) return;
             
             try {
-                const response = await fetch(\`/api/exam/\${currentSession}/answer\`, {
+                const response = await fetch('/api/exam/' + currentSession + '/answer', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
@@ -1304,7 +1437,7 @@ function getIndexHTML(): string {
             if (isCorrect) {
                 feedback.textContent = '✅ 回答正确！';
             } else {
-                feedback.textContent = \`❌ 回答错误，正确答案是：\${correctAnswer}\`;
+                feedback.textContent = '❌ 回答错误，正确答案是：' + correctAnswer;
             }
         }
         
@@ -1342,7 +1475,7 @@ function getIndexHTML(): string {
             }
             
             try {
-                const response = await fetch(\`/api/exam/\${currentSession}/finish\`, {
+                const response = await fetch('/api/exam/' + currentSession + '/finish', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -1392,7 +1525,7 @@ function getIndexHTML(): string {
                 'multiple_choice': '多选题'
             };
             const baseType = typeMap[type] || '未知题型';
-            return currentMode === 'review' ? \`错题复习 - \${baseType}\` : baseType;
+            return baseType;
         }
     </script>
 </body>

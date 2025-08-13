@@ -24,6 +24,15 @@
 		}
 	],
 	/**
+	 * KV Namespaces (create these and replace ids accordingly)
+	 */
+	"kv_namespaces": [
+		{
+			"binding": "SESSIONS",
+			"id": "01f8d174c2d34504ae7aef3ef405756a"
+		}
+	],
+	/**
 	 * Environment-specific configurations
 	 */
 	"env": {
@@ -33,6 +42,12 @@
 					"binding": "DB",
 					"database_name": "exam-database-prod",
 					"database_id": "ab98eb7f-07a3-4ea9-900d-eaa24113ef97"
+				}
+			],
+			"kv_namespaces": [
+				{
+					"binding": "SESSIONS",
+					"id": "75e6ad7d3ad64cb3aef9cb5e406f1ef8"
 				}
 			]
 		}

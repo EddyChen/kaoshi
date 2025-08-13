@@ -76,7 +76,7 @@ def main():
 			questions = payload.get('questionsWithChosen', [])
 			for q in questions:
 				norm = normalize_question(q)
-				insert_sql = to_insert_sql(norm, '科技类', '人工智能')
+				insert_sql = to_insert_sql(norm, '科技', '人工智能')
 				all_inserts.append(insert_sql)
 			# be gentle
 			time.sleep(0.2)

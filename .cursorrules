@@ -326,3 +326,38 @@ If needed, you can further use the `web_scraper.py` file to scrape the web page 
 
 ### 下一步
 所有功能已完整实现，项目目录结构已优化，系统提供完整的学习、考试、复习闭环体验
+
+### 新任务：会话与进度持久化（进行中）
+[X] 分析现有登录/会话实现（发现：无 Cookie/无 KV，会话仅靠前端变量）
+[X] 在 `wrangler.jsonc` 中新增 `SESSIONS` KV 绑定（需替换 DEV/PROD KV id）
+[X] 在 `src/index.ts` 中扩展 `Env` 增加 `SESSIONS: KVNamespace`
+[X] 登录成功后创建随机 token，写入 KV 中的 `session:{token}`，通过 `sid` Cookie 向客户端下发
+[X] 新增 `GET /api/me`：返回登录状态、活动会话 `activeSessionId`、以及 KV 中的进度
+[X] 在获取题目接口中把当前 `order`、`questionId`、`totalQuestions`、`mode` 写到 `progress:{sessionId}`
+[X] 考试完成时清理 `progress:{sessionId}`
+[X] 前端启动时调用 `/api/me` 自动恢复会话与进度（显示 `examPage` 并跳转到上次题号）
+[ ] 部署前替换 KV 命名空间 id（DEV/PROD），并在 Cloudflare 上创建命名空间
+
+### 说明
+- 本地开发时 `sid` Cookie 自动根据协议决定是否携带 `Secure` 属性；HTTP 开发不含 `Secure`，生产 HTTPS 下含 `Secure`。
+- 进度数据结构：`{ sessionId, userId, order, questionId, totalQuestions, mode }`，保留 7 天。
+
+### Lessons
+- 在 Cloudflare Workers 中维持无状态服务端时，使用 `KV` 存储轻量会话/进度是简洁可扩展方案。
+- 设置 Cookie 时在本地开发应避免强制 `Secure` 以便在 `http://localhost` 下正常发回。
+
+### 新任务：基础编程题解析与入库（进行中）
+[X] 阅读 `exam-app/data/*.html` 页面结构（Nowcoder风格：`question-item`、`question-select`、`answer-wrap` 等）
+[X] 编写解析脚本：`tools/parse_basic_programming_to_sql.py`（跳过含图片题；保留代码/HTML；忽略“官方解析/题友讨论”；题型/选项/答案准确）
+[X] 运行脚本生成 SQL：`exam-app/db/insert-questions-tech-basic-programming.sql`
+[X] 快速抽样核验（打印3条样例；统计类型计数）
+[ ] 导入到本地 D1：`wrangler d1 execute exam-database --file=exam-app/db/insert-questions-tech-basic-programming.sql`
+[ ] 线上环境导入（如需）：`wrangler d1 execute exam-database-prod --file=... --env production`
+
+说明
+- 分类：`category_big = 科技`，`category_small = 基础编程`
+- 解析结果：已解析 87 题（单选 72、多选 15，当前样本无判断题）
+
+### Lessons（新增）
+- 解析 Nowcoder 导出页面时，利用结构选择器更稳健：题干区去除 `answer-wrap`、`question-select`、`comment-wrap`；答案从 `answer-wrap` 中的“正确答案：”提取。
+- 含 `<img>` 的题（题干或选项）应跳过；代码块需保留原始 HTML 以免丢失高亮/格式。
