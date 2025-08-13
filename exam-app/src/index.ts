@@ -70,7 +70,11 @@ const router = new Router();
 // 静态文件服务
 router.add('GET', '/', async (request: Request, env: Env) => {
 	return new Response(getIndexHTML(), {
-		headers: { 'Content-Type': 'text/html' }
+		headers: {
+			'Content-Type': 'text/html',
+			// 放宽 CSP 以避免浏览器阻止 inline 脚本或 eval（开发/内嵌脚本场景）
+			'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+		}
 	});
 });
 
@@ -83,6 +87,15 @@ router.add('POST', '/api/login', async (request: Request, env: Env) => {
 		if (!phone || !/^1[3-9]\d{9}$/.test(phone)) {
 			return new Response(JSON.stringify({ error: '请输入有效的手机号' }), {
 				status: 400,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		// 白名单校验
+		const whitelisted = await env.DB.prepare('SELECT 1 FROM whitelist_users WHERE phone = ?').bind(phone).first();
+		if (!whitelisted) {
+			return new Response(JSON.stringify({ error: '该手机号未在白名单中，禁止登录' }), {
+				status: 403,
 				headers: { 'Content-Type': 'application/json' }
 			});
 		}
@@ -117,8 +130,8 @@ router.add('POST', '/api/login', async (request: Request, env: Env) => {
 // 开始考试
 router.add('POST', '/api/exam/start', async (request: Request, env: Env) => {
 	try {
-		const body = await request.json() as { userId?: number; mode?: string };
-		const { userId, mode } = body;
+		const body = await request.json() as { userId?: number; mode?: string; categoryBig?: string; categorySmall?: string; total?: number };
+		const { userId, mode, categoryBig, categorySmall, total } = body;
 		
 		if (!userId || !mode || !['study', 'exam'].includes(mode)) {
 			return new Response(JSON.stringify({ error: '参数错误' }), {
@@ -132,7 +145,9 @@ router.add('POST', '/api/exam/start', async (request: Request, env: Env) => {
 			'SELECT * FROM exam_sessions WHERE user_id = ? AND status = "active"'
 		).bind(userId).first();
 
-		if (activeSession) {
+		// 若用户显式选择了分类或数量，则不复用旧会话；否则如果存在活动会话则直接复用
+		const hasFilters = !!(categoryBig || categorySmall || (typeof total === 'number' && total > 0));
+		if (activeSession && !hasFilters && (activeSession as any).mode === mode) {
 			return new Response(JSON.stringify({ 
 				success: true, 
 				sessionId: (activeSession as any).id,
@@ -141,14 +156,19 @@ router.add('POST', '/api/exam/start', async (request: Request, env: Env) => {
 				headers: { 'Content-Type': 'application/json' }
 			});
 		}
+		// 存在旧会话且本次指定了筛选或数量，则将旧会话标记为放弃
+		if (activeSession && hasFilters) {
+			await env.DB.prepare('UPDATE exam_sessions SET status = "abandoned" WHERE id = ?')
+				.bind((activeSession as any).id).run();
+		}
 
 		// 创建新的考试会话
 		const session = await env.DB.prepare(
 			'INSERT INTO exam_sessions (user_id, mode) VALUES (?, ?) RETURNING *'
 		).bind(userId, mode).first();
 
-		// 智能选择题目
-		const questions = await selectRandomQuestions(env.DB, userId);
+		// 智能选择题目（支持分类与数量）
+		const questions = await selectRandomQuestions(env.DB, userId, categoryBig, categorySmall, typeof total === 'number' ? total : undefined);
 		
 		// 保存考试题目
 		for (let i = 0; i < questions.length; i++) {
@@ -159,7 +179,8 @@ router.add('POST', '/api/exam/start', async (request: Request, env: Env) => {
 
 		return new Response(JSON.stringify({ 
 			success: true, 
-			sessionId: (session as any).id 
+			sessionId: (session as any).id,
+			totalQuestions: questions.length
 		}), {
 			headers: { 'Content-Type': 'application/json' }
 		});
@@ -427,29 +448,46 @@ router.add('POST', '/api/user/:userId/review-wrong', async (request: Request, en
 });
 
 // 智能选择题目（优先选择未答过/答错过/答题次数少的题目）
-async function selectRandomQuestions(db: D1Database, userId?: number) {
-	// 按照原始要求：单选题20道，多选题10道，判断题20道，总共50道
-	
+async function selectRandomQuestions(db: D1Database, userId?: number, categoryBig?: string, categorySmall?: string, overrideTotal?: number) {
+	// 若用户指定题目数量，则忽略固定配比，按分类随机抽取指定数量
+	if (overrideTotal && overrideTotal > 0) {
+		const filters: string[] = [];
+		const binds: any[] = [];
+		if (categoryBig) {
+			filters.push('category_big = ?');
+			binds.push(categoryBig);
+		}
+		if (categorySmall) {
+			filters.push('category_small = ?');
+			binds.push(categorySmall);
+		}
+		const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+		const sql = `SELECT * FROM questions ${where} ORDER BY RANDOM() LIMIT ?`;
+		const res = await db.prepare(sql).bind(...binds, overrideTotal).all();
+		return res.results;
+	}
+
+	// 默认：按照原始要求：单选题20道，多选题10道，判断题20道，总共50道
 	let judgmentQuestions, singleChoiceQuestions, multipleChoiceQuestions;
 	
 	if (userId) {
-		// 智能选题：优先选择未答过、答错过、答题次数少的题目
-		judgmentQuestions = await selectIntelligentQuestions(db, userId, 'judgment', 20);
-		singleChoiceQuestions = await selectIntelligentQuestions(db, userId, 'single_choice', 20);
-		multipleChoiceQuestions = await selectIntelligentQuestions(db, userId, 'multiple_choice', 10);
+		// 智能选题：优先选择未答过、答错过、答题次数少的题目（支持分类过滤）
+		judgmentQuestions = await selectIntelligentQuestions(db, userId, 'judgment', 20, categoryBig, categorySmall);
+		singleChoiceQuestions = await selectIntelligentQuestions(db, userId, 'single_choice', 20, categoryBig, categorySmall);
+		multipleChoiceQuestions = await selectIntelligentQuestions(db, userId, 'multiple_choice', 10, categoryBig, categorySmall);
 	} else {
 		// 完全随机选择
 		judgmentQuestions = await db.prepare(
-			'SELECT * FROM questions WHERE type = "judgment" ORDER BY RANDOM() LIMIT 20'
-		).all();
+			`SELECT * FROM questions WHERE type = "judgment"${categoryBig ? ' AND category_big = ?' : ''}${categorySmall ? ' AND category_small = ?' : ''} ORDER BY RANDOM() LIMIT 20`
+		).bind(...([categoryBig, categorySmall].filter(Boolean) as any)).all();
 		
 		singleChoiceQuestions = await db.prepare(
-			'SELECT * FROM questions WHERE type = "single_choice" ORDER BY RANDOM() LIMIT 20'
-		).all();
+			`SELECT * FROM questions WHERE type = "single_choice"${categoryBig ? ' AND category_big = ?' : ''}${categorySmall ? ' AND category_small = ?' : ''} ORDER BY RANDOM() LIMIT 20`
+		).bind(...([categoryBig, categorySmall].filter(Boolean) as any)).all();
 		
 		multipleChoiceQuestions = await db.prepare(
-			'SELECT * FROM questions WHERE type = "multiple_choice" ORDER BY RANDOM() LIMIT 10'
-		).all();
+			`SELECT * FROM questions WHERE type = "multiple_choice"${categoryBig ? ' AND category_big = ?' : ''}${categorySmall ? ' AND category_small = ?' : ''} ORDER BY RANDOM() LIMIT 10`
+		).bind(...([categoryBig, categorySmall].filter(Boolean) as any)).all();
 		
 		judgmentQuestions = judgmentQuestions.results;
 		singleChoiceQuestions = singleChoiceQuestions.results;
@@ -473,17 +511,19 @@ async function selectRandomQuestions(db: D1Database, userId?: number) {
 		}
 	}
 	
-	// 如果去重后题目不足50道，补充随机题目
+	// 如果去重后题目不足50道，补充随机题目（按分类约束）
 	if (uniqueQuestions.length < 50) {
 		const neededCount = 50 - uniqueQuestions.length;
 		const excludeIds = Array.from(seenIds);
 		
 		const additionalQuestions = await db.prepare(`
 			SELECT * FROM questions 
-			WHERE id NOT IN (${excludeIds.map(() => '?').join(',')})
+			WHERE id NOT IN (${excludeIds.length ? excludeIds.map(() => '?').join(',') : 'NULL'})
+			${categoryBig ? ' AND category_big = ?' : ''}
+			${categorySmall ? ' AND category_small = ?' : ''}
 			ORDER BY RANDOM() 
 			LIMIT ?
-		`).bind(...excludeIds, neededCount).all();
+		`).bind(...excludeIds, ...([categoryBig, categorySmall].filter(Boolean) as any), neededCount).all();
 		
 		uniqueQuestions.push(...additionalQuestions.results);
 	}
@@ -492,25 +532,38 @@ async function selectRandomQuestions(db: D1Database, userId?: number) {
 }
 
 // 智能选择特定类型的题目
-async function selectIntelligentQuestions(db: D1Database, userId: number, type: string, limit: number) {
-	// 优先级：1.未答过的题目 2.答错过的题目 3.答题次数少的题目
-	const questions = await db.prepare(`
+async function selectIntelligentQuestions(db: D1Database, userId: number, type: string, limit: number, categoryBig?: string, categorySmall?: string) {
+	// 优先级：1.未答过的题目 2.答错过的题目 3.答题次数少的题目（可按分类过滤）
+	let whereClause = 'WHERE q.type = ?';
+	const binds: any[] = [userId, type];
+	if (categoryBig) {
+		whereClause += ' AND q.category_big = ?';
+		binds.push(categoryBig);
+	}
+	if (categorySmall) {
+		whereClause += ' AND q.category_small = ?';
+		binds.push(categorySmall);
+	}
+	binds.push(limit);
+
+	const sql = `
 		SELECT q.*, 
 			COALESCE(uqs.total_attempts, 0) as attempts,
 			COALESCE(uqs.correct_attempts, 0) as correct_attempts,
 			COALESCE(uqs.last_is_correct, 1) as last_is_correct,
 			CASE 
-				WHEN uqs.id IS NULL THEN 1  -- 未答过的题目，优先级最高
-				WHEN uqs.last_is_correct = 0 THEN 2  -- 答错过的题目
-				ELSE 3 + uqs.total_attempts  -- 答对过的题目，按答题次数排序
+				WHEN uqs.id IS NULL THEN 1
+				WHEN uqs.last_is_correct = 0 THEN 2
+				ELSE 3 + uqs.total_attempts
 			END as priority
 		FROM questions q
 		LEFT JOIN user_question_stats uqs ON q.id = uqs.question_id AND uqs.user_id = ?
-		WHERE q.type = ?
+		${whereClause}
 		ORDER BY priority ASC, RANDOM()
 		LIMIT ?
-	`).bind(userId, type, limit).all();
+	`;
 
+	const questions = await db.prepare(sql).bind(...binds).all();
 	return questions.results;
 }
 
@@ -603,6 +656,37 @@ function getIndexHTML(): string {
             outline: none;
             border-color: #667eea;
         }
+		
+		/* 新增：下拉与数字输入统一样式 */
+		select,
+		input[type="number"] {
+			width: 100%;
+			padding: 15px;
+			border: 2px solid #e1e5e9;
+			border-radius: 10px;
+			font-size: 16px;
+			transition: border-color 0.3s;
+			appearance: none;
+			background: white;
+		}
+
+		select:focus,
+		input[type="number"]:focus {
+			outline: none;
+			border-color: #667eea;
+		}
+
+		/* 新增：筛选行布局 */
+		.filters-row {
+			display: flex;
+			gap: 10px;
+			flex-wrap: wrap;
+		}
+
+		.filter-item {
+			flex: 1;
+			min-width: 100px;
+		}
         
         .mode-selection {
             margin: 20px 0;
@@ -611,12 +695,12 @@ function getIndexHTML(): string {
         .mode-buttons {
             display: flex;
             gap: 10px;
-            flex-wrap: wrap;
+            flex-wrap: nowrap; /* 一行显示 */
         }
         
         .mode-btn {
             flex: 1;
-            min-width: 120px;
+            min-width: 100px;
             padding: 15px;
             border: 2px solid #e1e5e9;
             border-radius: 10px;
@@ -914,13 +998,39 @@ function getIndexHTML(): string {
                 <label for="phone">手机号</label>
                 <input type="tel" id="phone" placeholder="请输入11位手机号" maxlength="11">
             </div>
+
+
+			<div class="form-group">
+				<div class="filters-row">
+					<div class="filter-item">
+						<label for="categoryBig">题目大类</label>
+						<select id="categoryBig">
+							<option value="">全部</option>
+							<option value="信贷">信贷</option>
+							<option value="科技类">科技类</option>
+						</select>
+					</div>
+					<div class="filter-item">
+						<label for="categorySmall">题目小类</label>
+						<select id="categorySmall">
+							<option value="">全部</option>
+							<option value="A类">A类</option>
+							<option value="人工智能">人工智能</option>
+						</select>
+					</div>
+					<div class="filter-item">
+						<label for="total">题目数量</label>
+						<input type="number" id="total" placeholder="默认50" min="1" max="100" />
+					</div>
+				</div>
+			</div>
             
             <div class="mode-selection">
                 <label>选择模式</label>
                 <div class="mode-buttons">
-                    <button class="mode-btn active" data-mode="study">背题模式</button>
-                    <button class="mode-btn" data-mode="exam">考试模式</button>
-                    <button class="mode-btn" data-mode="review">错题复习</button>
+                    <button type="button" class="mode-btn active" data-mode="study">背题模式</button>
+                    <button type="button" class="mode-btn" data-mode="exam">考试模式</button>
+                    <button type="button" class="mode-btn" data-mode="review">错题复习</button>
                 </div>
             </div>
             
@@ -1025,7 +1135,7 @@ function getIndexHTML(): string {
         }
         
         // 开始考试
-        async function startExam() {
+		async function startExam() {
             try {
                 let response, data;
                 
@@ -1035,12 +1145,19 @@ function getIndexHTML(): string {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' }
                     });
-                } else {
-                    // 普通考试模式
+				} else {
+					// 普通考试模式（纯JS，避免TS语法）
+					const categoryBigEl = document.getElementById('categoryBig');
+					const categorySmallEl = document.getElementById('categorySmall');
+					const totalEl = document.getElementById('total');
+					const categoryBig = categoryBigEl && categoryBigEl.value ? categoryBigEl.value : undefined;
+					const categorySmall = categorySmallEl && categorySmallEl.value ? categorySmallEl.value : undefined;
+					const totalStr = totalEl && totalEl.value ? totalEl.value : '';
+					const total = totalStr ? parseInt(totalStr, 10) : undefined;
                     response = await fetch('/api/exam/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ userId: currentUser.id, mode: currentMode })
+						body: JSON.stringify({ userId: currentUser.id, mode: currentMode, categoryBig, categorySmall, total })
                     });
                 }
                 

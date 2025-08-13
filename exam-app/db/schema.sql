@@ -4,7 +4,9 @@ CREATE TABLE IF NOT EXISTS questions (
     type TEXT NOT NULL CHECK (type IN ('judgment', 'single_choice', 'multiple_choice')),
     question TEXT NOT NULL,
     options TEXT, -- JSON格式存储选项，判断题为NULL
-    answer TEXT NOT NULL,
+	answer TEXT NOT NULL,
+	category_big TEXT,
+	category_small TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
